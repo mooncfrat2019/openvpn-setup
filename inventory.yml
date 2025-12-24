@@ -1,0 +1,100 @@
+---
+all:
+  vars:
+    # Глобальные переменные Ansible
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_user: specter
+    ansible_ssh_private_key_file: ~/.ssh/id_rsa
+
+    # Отключаем строгую проверку хостов (Host Key Checking)
+    ansible_host_key_checking: false
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    # Настройки подключения
+    ansible_connection: ssh
+    ansible_port: 22
+    ansible_become: true
+    ansible_become_method: sudo
+    ansible_become_user: root
+
+    # Таймауты для стабильного подключения
+    ansible_ssh_timeout: 30
+    ansible_command_timeout: 600
+
+    new_client_name: dolores
+
+    # Глобальные переменные OpenVPN (могут быть переопределены на уровне хоста/группы)
+    openvpn_global:
+      # Основные настройки VPN
+      vpn_port: 1194
+      vpn_proto: udp
+      vpn_network: "10.8.0.0"
+      vpn_netmask: "255.255.255.0"
+      vpn_dns: "8.8.8.8"
+
+      # Криптографические настройки
+      vpn_cipher: "AES-256-GCM"
+      vpn_auth: "SHA256"
+      tls_version_min: "1.2"
+      tls_crypt_v2_enabled: true
+
+      # Настройки CA
+      ca_country: "RU"
+      ca_province: "Moscow"
+      ca_city: "Moscow"
+      ca_org: "VPN Company"
+      ca_email: "admin@example.com"
+      ca_ou: "IT Department"
+
+      # Пути
+      easyrsa_dir: "/opt/easy-rsa"
+      openvpn_dir: "/etc/openvpn"
+
+      # Имена сертификатов
+      server_name: "vpn-server"
+      client_name: "vpn-client"
+
+      # Дополнительные настройки
+      push_routes: []
+      push_dns:
+        - "8.8.8.8"
+        - "8.8.4.4"
+      compression: "none"
+
+  hosts:
+    # Пример одиночного хоста
+    vpn-server-1:
+      ansible_host: "{{ vpn-server-1_host }}"
+      ansible_user: "{{ vpn-server-1_user }}"
+      # Здесь можно переопределить глобальные переменные для этого хоста
+      vpn_server_ip: "{{ vpn-server-1_ip }}"
+      server_name: "{{ vpn-server-1_name }}"
+
+  children:
+    # Группа для всех VPN серверов
+    vpn_servers:
+      hosts:
+        vpn-server-1:
+      vars:
+        # Общие переменные для всех VPN серверов
+        openvpn_enabled: true
+        firewall_enabled: true
+        ufw_enabled: true
+
+        # Настройки фаервола
+        firewall_rules:
+          - port: "{{ vpn_port }}"
+            proto: "{{ vpn_proto }}"
+            state: enabled
+
+        # Настройки мониторинга
+        monitoring_enabled: true
+        vpn_log_dir: "/var/log/openvpn"
+
+        # Автоматическое создание клиентов
+        auto_create_clients: true
+        default_clients:
+          - name: "{{ client_1_name }}"
+            type: "permanent"
+          - name: "{{ client_2_name }}"
+            type: "permanent"

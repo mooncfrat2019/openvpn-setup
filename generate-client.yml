@@ -1,0 +1,179 @@
+---
+- name: Генерация нового клиентского файла OpenVPN
+  hosts: all
+  become: yes
+  vars:
+    # Переменные для нового клиента
+    new_client_name: "client2"  # Имя нового клиента
+    easyrsa_dir: "/opt/easy-rsa"
+    openvpn_dir: "/etc/openvpn"
+    server_dir: "{{ openvpn_dir }}/server"
+
+    # Данные CA (должны совпадать с существующими)
+    ca_country: "RU"
+    ca_province: "Moscow"
+    ca_city: "Moscow"
+    ca_org: "MyCompany"
+    ca_email: "admin@mycompany.com"
+    ca_ou: "IT"
+
+    # Настройки сервера
+    vpn_server_ip: "{{ ansible_default_ipv4.address }}"
+    vpn_port: 1194
+    vpn_proto: "udp"
+
+  tasks:
+    # 1. Проверка существования CA
+    - name: Проверка существования CA
+      stat:
+        path: "{{ easyrsa_dir }}/pki/ca.crt"
+      register: ca_check
+
+    - name: Выход если CA не существует
+      fail:
+        msg: "CA не найден в {{ easyrsa_dir }}/pki/. Сначала запустите основной плейбук установки OpenVPN."
+      when: not ca_check.stat.exists
+
+    # 2. Создание клиентского сертификата
+    - name: Создание клиентского запроса
+      command:
+        cmd: ./easyrsa --batch gen-req {{ new_client_name }} nopass
+        chdir: "{{ easyrsa_dir }}"
+      args:
+        creates: "{{ easyrsa_dir }}/pki/private/{{ new_client_name }}.key"
+      register: gen_req
+      failed_when: gen_req.rc != 0 and "'already exists' not in gen_req.stdout"
+
+    - name: Подписание клиентского сертификата
+      command:
+        cmd: ./easyrsa --batch sign-req client {{ new_client_name }}
+        chdir: "{{ easyrsa_dir }}"
+      args:
+        creates: "{{ easyrsa_dir }}/pki/issued/{{ new_client_name }}.crt"
+      register: sign_req
+      failed_when: sign_req.rc != 0 and "'already exists' not in sign_req.stdout"
+
+    # 3. Получение содержимого файлов
+    - name: Получение содержимого CA сертификата
+      shell: cat {{ easyrsa_dir }}/pki/ca.crt
+      register: ca_content
+      changed_when: false
+
+    - name: Получение содержимого клиентского сертификата
+      shell: cat {{ easyrsa_dir }}/pki/issued/{{ new_client_name }}.crt
+      register: cert_content
+      changed_when: false
+
+    - name: Получение содержимого клиентского ключа
+      shell: cat {{ easyrsa_dir }}/pki/private/{{ new_client_name }}.key
+      register: key_content
+      changed_when: false
+
+    - name: Получение содержимого TLS ключа
+      shell: cat {{ easyrsa_dir }}/ta.key
+      register: ta_content
+      changed_when: false
+
+    - name: Получение конфигурации сервера для определения параметров
+      shell: |
+        grep -E "^(cipher|auth|proto|port)" {{ server_dir }}/server.conf || true
+      register: server_config
+      changed_when: false
+
+    # 4. Определение параметров шифрования из конфига сервера
+    - name: Извлечение параметров шифрования
+      set_fact:
+        vpn_cipher: "{{ server_config.stdout_lines | select('match', '^cipher') | list | first | default('AES-256-GCM') | regex_replace('^cipher\\s+', '') }}"
+        vpn_auth: "{{ server_config.stdout_lines | select('match', '^auth') | list | first | default('SHA512') | regex_replace('^auth\\s+', '') }}"
+        vpn_proto: "{{ server_config.stdout_lines | select('match', '^proto') | list | first | default('udp') | regex_replace('^proto\\s+', '') }}"
+        vpn_port: "{{ server_config.stdout_lines | select('match', '^port') | list | first | default('1194') | regex_replace('^port\\s+', '') }}"
+
+    # 5. Создание клиентского конфигурационного файла
+    - name: Создание базового OVPN файла
+      copy:
+        dest: "/home/{{ ansible_user }}/{{ new_client_name }}.ovpn"
+        content: |
+          # OpenVPN Client Configuration for {{ new_client_name }}
+          # Generated: {{ ansible_date_time.date }}
+          # Server: {{ vpn_server_ip }}
+          
+          client
+          dev tun
+          proto {{ vpn_proto }}
+          remote {{ vpn_server_ip }} {{ vpn_port }}
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher {{ vpn_cipher }}
+          auth {{ vpn_auth }}
+          verb 3
+          auth-nocache
+          
+          <ca>
+          </ca>
+          
+          <cert>
+          </cert>
+          
+          <key>
+          </key>
+          
+          key-direction 1
+          <tls-auth>
+          </tls-auth>
+        mode: '0600'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    # 6. Вставка сертификатов и ключей
+    - name: Вставка CA сертификата
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ new_client_name }}.ovpn"
+        insertafter: '<ca>'
+        line: "{{ ca_content.stdout }}"
+        backup: yes
+
+    - name: Вставка клиентского сертификата
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ new_client_name }}.ovpn"
+        insertafter: '<cert>'
+        line: "{{ cert_content.stdout }}"
+        backup: yes
+
+    - name: Вставка клиентского ключа
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ new_client_name }}.ovpn"
+        insertafter: '<key>'
+        line: "{{ key_content.stdout }}"
+        backup: yes
+
+    - name: Вставка TLS ключа
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ new_client_name }}.ovpn"
+        insertafter: '<tls-auth>'
+        line: "{{ ta_content.stdout }}"
+        backup: yes
+
+    # 10. Вывод информации
+    - name: Вывод информации о созданном файле
+      debug:
+        msg: |
+          ✅ Новый клиентский файл OpenVPN успешно создан!
+          
+          📁 Основной файл: /home/{{ ansible_user }}/{{ new_client_name }}.ovpn
+          📦 Архив: /home/{{ ansible_user }}/{{ new_client_name }}-config.zip
+          
+          🌐 Сервер: {{ vpn_server_ip }}
+          🚪 Порт: {{ vpn_port }}
+          🔐 Протокол: {{ vpn_proto }}
+          🔑 Шифрование: {{ vpn_cipher }}/{{ vpn_auth }}
+          
+          📋 Для подключения:
+          1. Скопируйте файл {{ new_client_name }}.ovpn на клиент
+          2. Установите OpenVPN клиент
+          3. Импортируйте файл .ovpn
+          4. Подключитесь к серверу
+          
+          ⚠️  Файл содержит приватные ключи! Храните в безопасности!

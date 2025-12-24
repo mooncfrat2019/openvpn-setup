@@ -1,0 +1,372 @@
+---
+- name: Установка и настройка OpenVPN сервера на Ubuntu 24.04
+  hosts: all
+  become: yes
+  vars:
+    vpn_server_ip: "{{ ansible_default_ipv4.address }}"
+    vpn_port: 1194
+    vpn_proto: udp
+    vpn_network: "10.8.0.0"
+    vpn_netmask: "255.255.255.0"
+    vpn_dns: "8.8.8.8"
+
+    easyrsa_dir: "/opt/easy-rsa"
+    openvpn_dir: "/etc/openvpn"
+    server_dir: "{{ openvpn_dir }}/server"
+
+    ca_country: "RU"
+    ca_province: "Moscow"
+    ca_city: "Moscow"
+    ca_org: "MyCompany"
+    ca_email: "admin@mycompany.com"
+    ca_ou: "IT"
+
+    server_name: "server"
+    client_name: "client1"
+
+  tasks:
+    # 1. Установка пакетов
+    - name: Обновление apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Установка необходимых пакетов
+      apt:
+        name:
+          - openvpn
+          - easy-rsa
+          - openssl
+        state: present
+
+    # 2. Подготовка директорий
+    - name: Создание директорий
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ server_dir }}"
+        - "{{ easyrsa_dir }}"
+
+    # 3. Копирование easy-rsa файлов
+    - name: Копирование Easy-RSA файлов
+      shell: |
+        cp -r /usr/share/easy-rsa/* {{ easyrsa_dir }}/
+        chmod 755 {{ easyrsa_dir }}/*
+      args:
+        creates: "{{ easyrsa_dir }}/easyrsa"
+
+    - name: Создание ссылки на easyrsa
+      file:
+        src: "{{ easyrsa_dir }}/easyrsa"
+        dest: "/usr/local/bin/easyrsa"
+        state: link
+
+    # 4. Настройка easy-rsa с усиленной безопасностью
+    - name: Создание файла vars
+      copy:
+        dest: "{{ easyrsa_dir }}/vars"
+        content: |
+          # Безопасные настройки для Ubuntu 24.04
+          set_var EASYRSA_REQ_COUNTRY    "{{ ca_country }}"
+          set_var EASYRSA_REQ_PROVINCE   "{{ ca_province }}"
+          set_var EASYRSA_REQ_CITY       "{{ ca_city }}"
+          set_var EASYRSA_REQ_ORG        "{{ ca_org }}"
+          set_var EASYRSA_REQ_EMAIL      "{{ ca_email }}"
+          set_var EASYRSA_REQ_OU         "{{ ca_ou }}"
+          set_var EASYRSA_ALGO           "ec"           # Эллиптические кривые - современнее RSA
+          set_var EASYRSA_CURVE          "secp521r1"    # Кривая с 521-битной безопасностью
+          set_var EASYRSA_DIGEST         "sha512"       # SHA512 для максимальной безопасности
+          set_var EASYRSA_KEY_SIZE       4096           # Для RSA был бы 4096, для EC не нужно
+          set_var EASYRSA_BATCH          "yes"
+          set_var EASYRSA_CA_EXPIRE      3650
+          set_var EASYRSA_CERT_EXPIRE    825            # 2 года + 95 дней для совместимости
+          set_var EASYRSA_CRL_DAYS       180
+          set_var EASYRSA_NS_SUPPORT     "no"
+          set_var EASYRSA_NS_COMMENT     "OpenVPN Generated Certificate"
+        mode: '0644'
+
+    # 5. Инициализация PKI
+    - name: Инициализация PKI
+      command:
+        cmd: ./easyrsa init-pki
+        chdir: "{{ easyrsa_dir }}"
+      args:
+        creates: "{{ easyrsa_dir }}/pki"
+
+    # 6. Создание CA с явным указанием алгоритма
+    - name: Создание CA
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --use-algo=ec --curve=secp521r1 --digest=sha512 build-ca nopass <<EOF
+        {{ ca_org }}
+        EOF
+      args:
+        creates: "{{ easyrsa_dir }}/pki/ca.crt"
+      register: ca_result
+      failed_when: ca_result.rc != 0 and "'already exists' not in ca_result.stdout"
+
+    # 7. Альтернативный метод создания CA если EC не работает
+    - name: Создание CA с RSA (fallback)
+      when: ca_result is failed
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --use-algo=rsa --keysize=4096 --digest=sha512 build-ca nopass <<EOF
+        {{ ca_org }}
+        EOF
+      args:
+        creates: "{{ easyrsa_dir }}/pki/ca.crt"
+
+    # 8. Создание серверного сертификата
+    - name: Создание серверного запроса
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --digest=sha512 gen-req {{ server_name }} nopass
+      args:
+        creates: "{{ easyrsa_dir }}/pki/private/{{ server_name }}.key"
+
+    - name: Подписание серверного сертификата
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --digest=sha512 sign-req server {{ server_name }}
+      args:
+        creates: "{{ easyrsa_dir }}/pki/issued/{{ server_name }}.crt"
+
+    # 9. Создание DH параметров с увеличенным размером
+    - name: Генерация DH параметров
+      shell: |
+        cd {{ easyrsa_dir }}
+        echo "генерация DH параметров 2048 бит..."
+        openssl dhparam -out pki/dh.pem 2048 -dsaparam
+        echo "DH параметры сгенерированы!"
+      args:
+        creates: "{{ easyrsa_dir }}/pki/dh.pem"
+
+    # 10. Создание TLS ключа
+    - name: Генерация TLS ключа
+      command:
+        cmd: openvpn --genkey secret ta.key
+        chdir: "{{ easyrsa_dir }}"
+      args:
+        creates: "{{ easyrsa_dir }}/ta.key"
+
+    # 11. Создание клиентского сертификата
+    - name: Создание клиентского запроса
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --digest=sha512 gen-req {{ client_name }} nopass
+      args:
+        creates: "{{ easyrsa_dir }}/pki/private/{{ client_name }}.key"
+
+    - name: Подписание клиентского сертификата
+      shell: |
+        cd {{ easyrsa_dir }}
+        ./easyrsa --digest=sha512 sign-req client {{ client_name }}
+      args:
+        creates: "{{ easyrsa_dir }}/pki/issued/{{ client_name }}.crt"
+
+    # 12. Копирование файлов на сервер
+    - name: Копирование сертификатов
+      copy:
+        src: "{{ item.src }}"
+        dest: "{{ server_dir }}/{{ item.dest }}"
+        mode: '0644'
+        remote_src: yes
+      loop:
+        - { src: '{{ easyrsa_dir }}/pki/ca.crt', dest: 'ca.crt' }
+        - { src: '{{ easyrsa_dir }}/pki/issued/{{ server_name }}.crt', dest: '{{ server_name }}.crt' }
+        - { src: '{{ easyrsa_dir }}/pki/private/{{ server_name }}.key', dest: '{{ server_name }}.key' }
+        - { src: '{{ easyrsa_dir }}/pki/dh.pem', dest: 'dh.pem' }
+        - { src: '{{ easyrsa_dir }}/ta.key', dest: 'ta.key' }
+
+    # 13. Создание конфигурации сервера с усиленной безопасностью
+    - name: Создание конфигурации сервера
+      copy:
+        dest: "{{ server_dir }}/server.conf"
+        content: |
+          # Основные настройки
+          port {{ vpn_port }}
+          proto {{ vpn_proto }}
+          dev tun
+          
+          # Сертификаты и ключи
+          ca ca.crt
+          cert {{ server_name }}.crt
+          key {{ server_name }}.key
+          dh dh.pem
+          
+          # Сеть
+          server {{ vpn_network }} {{ vpn_netmask }}
+          ifconfig-pool-persist ipp.txt
+          
+          # Клиентские настройки
+          push "redirect-gateway def1 bypass-dhcp"
+          push "dhcp-option DNS {{ vpn_dns }}"
+          push "dhcp-option DNS 1.1.1.1"
+          
+          # Усиленная безопасность
+          tls-auth ta.key 0
+          tls-version-min 1.2
+          tls-cipher TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+          cipher AES-256-GCM
+          auth SHA512  # Используем SHA512 вместо SHA256
+          data-ciphers AES-256-GCM:AES-256-CBC
+          data-ciphers-fallback AES-256-CBC
+          
+          # Perfect Forward Secrecy
+          reneg-sec 3600
+          
+          # Производительность
+          keepalive 10 120
+          persist-key
+          persist-tun
+          
+          # Логирование
+          status openvpn-status.log
+          log /var/log/openvpn.log
+          verb 3
+          
+          # Безопасность
+          user nobody
+          group nogroup
+          auth-nocache
+          tls-server
+          
+          # Уведомления
+          explicit-exit-notify 1
+        mode: '0644'
+
+    # 14. Включение IP форвардинга
+    - name: Включение IP форвардинга
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    # 15. Настройка фаервола
+    - name: Разрешение порта OpenVPN
+      ufw:
+        rule: allow
+        port: "{{ vpn_port }}"
+        proto: "{{ vpn_proto }}"
+
+    - name: Включение форвардинга в UFW
+      lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+
+    # 16. Запуск сервиса
+    - name: Запуск OpenVPN сервера
+      systemd:
+        name: openvpn-server@server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    # 17. Создание клиентского файла с безопасными настройками
+    - name: Создание клиентского файла
+      copy:
+        dest: "/home/{{ ansible_user }}/{{ client_name }}.ovpn"
+        content: |
+          client
+          dev tun
+          proto {{ vpn_proto }}
+          remote {{ vpn_server_ip }} {{ vpn_port }}
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-GCM
+          auth SHA512
+          tls-version-min 1.2
+          tls-cipher TLS-ECDHE-ECDSA-WITH-AES-256-GCM-SHA384:TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384
+          verb 3
+          auth-nocache
+          
+          <ca>
+          </ca>
+          
+          <cert>
+          </cert>
+          
+          <key>
+          </key>
+          
+          key-direction 1
+          <tls-auth>
+          </tls-auth>
+        mode: '0600'
+
+    - name: Получение содержимого CA сертификата
+      shell: cat {{ easyrsa_dir }}/pki/ca.crt
+      register: ca_content
+
+    - name: Добавление CA сертификата в клиентский файл
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ client_name }}.ovpn"
+        insertafter: '<ca>'
+        line: "{{ ca_content.stdout }}"
+
+    - name: Получение содержимого клиентского сертификата
+      shell: cat {{ easyrsa_dir }}/pki/issued/{{ client_name }}.crt
+      register: cert_content
+
+    - name: Добавление клиентского сертификата
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ client_name }}.ovpn"
+        insertafter: '<cert>'
+        line: "{{ cert_content.stdout }}"
+
+    - name: Получение содержимого клиентского ключа
+      shell: cat {{ easyrsa_dir }}/pki/private/{{ client_name }}.key
+      register: key_content
+
+    - name: Добавление клиентского ключа
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ client_name }}.ovpn"
+        insertafter: '<key>'
+        line: "{{ key_content.stdout }}"
+
+    - name: Получение содержимого TLS ключа
+      shell: cat {{ easyrsa_dir }}/ta.key
+      register: ta_content
+
+    - name: Добавление TLS ключа
+      lineinfile:
+        path: "/home/{{ ansible_user }}/{{ client_name }}.ovpn"
+        insertafter: '<tls-auth>'
+        line: "{{ ta_content.stdout }}"
+
+    # 18. Проверка безопасности
+    - name: Проверка алгоритмов сертификатов
+      shell: |
+        openssl x509 -in {{ easyrsa_dir }}/pki/ca.crt -text -noout | grep -E "Signature Algorithm|Public Key Algorithm"
+      register: cert_check
+
+    - name: Вывод информации о безопасности
+      debug:
+        msg: |
+          ✅ OpenVPN сервер установлен с усиленной безопасностью!
+          
+          🔐 Проверка алгоритмов:
+          {{ cert_check.stdout }}
+          
+          📁 Клиентский файл: /home/{{ ansible_user }}/{{ client_name }}.ovpn
+          🌐 IP сервера: {{ vpn_server_ip }}
+          🚪 Порт: {{ vpn_port }}
+          🛡️  Используемые алгоритмы:
+            - Хэш: SHA512 (усиленный)
+            - Шифрование: AES-256-GCM
+            - Кривые: secp521r1 (EC) или RSA 4096
+            - TLS: версия 1.2+
+          
+          📋 Для подключения:
+          1. Скопируйте файл {{ client_name }}.ovpn на клиент
+          2. Установите OpenVPN клиент
+          3. Импортируйте файл .ovpn
+          4. Подключитесь к серверу
