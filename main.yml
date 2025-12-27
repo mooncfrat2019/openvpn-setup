@@ -138,7 +138,7 @@
       shell: |
         cd {{ easyrsa_dir }}
         echo "генерация DH параметров 2048 бит..."
-        openssl dhparam -out pki/dh.pem 2048 -dsaparam
+        openssl dhparam -out {{ easyrsa_dir }}/pki/dh.pem 2048 -dsaparam
         echo "DH параметры сгенерированы!"
       args:
         creates: "{{ easyrsa_dir }}/pki/dh.pem"
